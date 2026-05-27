@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 uefi = { version = "0.37.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
-smoltcp = { version = "0.13.1", default-features = false, features = ["alloc", "async", "socket-dhcpv4", "socket-tcp"] }
+smoltcp = { version = "0.13.1", default-features = false, features = ["alloc", "async", "socket-dhcpv4", "socket-tcp", "socket-icmp", "auto-icmp-echo-reply"] }
 log = "0.4.30"
 uefi-raw = "0.14.0"
 httparse = { version = "1.9.0", default-features = false }
