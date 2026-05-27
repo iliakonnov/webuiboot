@@ -1,0 +1,196 @@
+import { Button, VerticalBox, ScrollView } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    background: @linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    title: "UEFI Bootloader Selection";
+
+    in-out property <string> ip-address: "Acquiring IP...";
+    in-out property <string> status-text: "Select OS to boot (Use Arrow keys + Enter, or 1 / 2)";
+    in-out property <int> selected-index: 0; // 0 = Windows, 1 = Linux
+    in-out property <string> log-text: "";
+
+
+
+    callback boot-windows();
+    callback boot-linux();
+
+    forward-focus: key-handler;
+    key-handler := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow || event.text == Key.RightArrow || event.text == Key.Tab) {
+                root.selected-index = root.selected-index == 0 ? 1 : 0;
+                return accept;
+            }
+            if (event.text == "\n" || event.text == " ") {
+                if (root.selected-index == 0) {
+                    root.status-text = "Booting Windows...";
+                    root.boot-windows();
+                } else {
+                    root.status-text = "Booting Linux...";
+                    root.boot-linux();
+                }
+                return accept;
+            }
+            if (event.text == "1" || event.text == "w" || event.text == "W") {
+                root.selected-index = 0;
+                root.status-text = "Booting Windows...";
+                root.boot-windows();
+                return accept;
+            }
+            if (event.text == "2" || event.text == "l" || event.text == "L") {
+                root.selected-index = 1;
+                root.status-text = "Booting Linux...";
+                root.boot-linux();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    init => {
+        key-handler.focus();
+    }
+
+    Rectangle {
+        width: 800px;
+        height: 560px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+
+        VerticalBox {
+            alignment: center;
+            spacing: 20px;
+            padding: 20px;
+
+        // Title and Header
+        Text {
+            text: "Select Operating System";
+            font-size: 32px;
+            font-weight: 300;
+            color: #f8fafc;
+            horizontal-alignment: center;
+        }
+
+        // Subtitle / IP info
+        Text {
+            text: "Network Address: " + root.ip-address;
+            font-size: 16px;
+            color: #94a3b8;
+            horizontal-alignment: center;
+        }
+
+        // Status text
+        Text {
+            text: root.status-text;
+            font-size: 16px;
+            color: #38bdf8;
+            horizontal-alignment: center;
+        }
+
+        // Action Buttons
+        HorizontalLayout {
+            alignment: center;
+            spacing: 40px;
+
+            // Windows Button
+            Rectangle {
+                width: 240px;
+                height: 120px;
+                background: @linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+                border-radius: 16px;
+                border-width: root.selected-index == 0 ? 4px : 1px;
+                border-color: root.selected-index == 0 ? #38bdf8 : #0284c7;
+                
+                TouchArea {
+                    clicked => {
+                        root.selected-index = 0;
+                        root.status-text = "Booting Windows...";
+                        root.boot-windows();
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    Text {
+                        text: "Windows";
+                        font-size: 24px;
+                        font-weight: 700;
+                        color: #ffffff;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+
+            // Linux Button
+            Rectangle {
+                width: 240px;
+                height: 120px;
+                background: @linear-gradient(135deg, #ea580c 0%, #c2410c 100%);
+                border-radius: 16px;
+                border-width: root.selected-index == 1 ? 4px : 1px;
+                border-color: root.selected-index == 1 ? #fb923c : #ea580c;
+
+                TouchArea {
+                    clicked => {
+                        root.selected-index = 1;
+                        root.status-text = "Booting Linux...";
+                        root.boot-linux();
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    Text {
+                        text: "Linux";
+                        font-size: 24px;
+                        font-weight: 700;
+                        color: #ffffff;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Log Console
+        VerticalBox {
+            spacing: 5px;
+            Text {
+                text: "System Logs:";
+                font-size: 12px;
+                color: #64748b;
+            }
+            Rectangle {
+                height: 140px;
+                background: #090d16;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #1e293b;
+
+                scroll-view := ScrollView {
+                    changed viewport-height => {
+                        if (self.viewport-height > self.height) {
+                            self.viewport-y = self.height - self.viewport-height;
+                        }
+                    }
+                    VerticalBox {
+                        padding-top: 8px;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-bottom: 16px;
+                        Text {
+                            text: root.log-text;
+                            font-size: 11px;
+                            font-family: "monospace";
+                            color: #a7f3d0; // Emerald-green terminal color
+                            wrap: word-wrap;
+                            height: self.preferred-height;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    }
+}
