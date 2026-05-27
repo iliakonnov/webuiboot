@@ -280,7 +280,7 @@ async fn run_slint_ui(
     window: Rc<software_renderer::MinimalSoftwareWindow>,
     gop: &'static mut GraphicsOutput,
     fb: &'static mut [SlintBltPixel],
-    mfb: &'static mut [BltPixel],
+    _mfb: &'static mut [BltPixel],
     screen_width: usize,
     screen_height: usize,
     scale_factor: f32,
@@ -373,9 +373,40 @@ async fn run_slint_ui(
         window.draw_if_needed(|renderer| {
             renderer.render(fb, screen_width);
 
-            let blt_fb = unsafe { slice::from_raw_parts(fb.as_ptr() as *const BltPixel, fb.len()) };
-            let blt_mfb = unsafe { slice::from_raw_parts_mut(mfb.as_mut_ptr() as *mut BltPixel, mfb.len()) };
+            // 1. Save background under cursor in RAM
+            let mut saved_cursor_bg = [SlintBltPixel(BltPixel::new(0, 0, 0)); POINTER_WIDTH * POINTER_HEIGHT];
+            for y in 0..POINTER_HEIGHT {
+                for x in 0..POINTER_WIDTH {
+                    let px = phys_x as usize + x;
+                    let py = phys_y as usize + y;
+                    if px < screen_width && py < screen_height {
+                        let fb_idx = py * screen_width + px;
+                        let bg_idx = x + y * POINTER_WIDTH;
+                        saved_cursor_bg[bg_idx] = fb[fb_idx];
+                    }
+                }
+            }
 
+            // 2. Draw cursor onto RAM frame buffer
+            for y in 0..POINTER_HEIGHT {
+                for x in 0..POINTER_WIDTH {
+                    let px = phys_x as usize + x;
+                    let py = phys_y as usize + y;
+                    if px < screen_width && py < screen_height {
+                        let fb_idx = py * screen_width + px;
+                        let bg_idx = x + y * POINTER_WIDTH;
+                        let pixel_type = POINTER_PIXELS[bg_idx];
+                        if pixel_type == 1 {
+                            fb[fb_idx] = SlintBltPixel(BltPixel::new(255, 255, 255));
+                        } else if pixel_type == 2 {
+                            fb[fb_idx] = SlintBltPixel(BltPixel::new(0, 0, 0));
+                        }
+                    }
+                }
+            }
+
+            // 3. Single atomic GOP write to screen VRAM
+            let blt_fb = unsafe { slice::from_raw_parts(fb.as_ptr() as *const BltPixel, fb.len()) };
             let _ = gop.blt(BltOp::BufferToVideo {
                 buffer: blt_fb,
                 src: BltRegion::Full,
@@ -383,31 +414,18 @@ async fn run_slint_ui(
                 dims: (screen_width, screen_height),
             });
 
-            let _ = gop.blt(BltOp::VideoToBltBuffer {
-                buffer: blt_mfb,
-                src: (phys_x as usize, phys_y as usize),
-                dest: BltRegion::Full,
-                dims: (POINTER_WIDTH, POINTER_HEIGHT),
-            });
-
+            // 4. Restore background in RAM frame buffer to prevent trails
             for y in 0..POINTER_HEIGHT {
                 for x in 0..POINTER_WIDTH {
-                    let idx = x + y * POINTER_WIDTH;
-                    let pixel_type = POINTER_PIXELS[idx];
-                    if pixel_type == 1 {
-                        blt_mfb[idx] = BltPixel::new(255, 255, 255);
-                    } else if pixel_type == 2 {
-                        blt_mfb[idx] = BltPixel::new(0, 0, 0);
+                    let px = phys_x as usize + x;
+                    let py = phys_y as usize + y;
+                    if px < screen_width && py < screen_height {
+                        let fb_idx = py * screen_width + px;
+                        let bg_idx = x + y * POINTER_WIDTH;
+                        fb[fb_idx] = saved_cursor_bg[bg_idx];
                     }
                 }
             }
-
-            let _ = gop.blt(BltOp::BufferToVideo {
-                buffer: blt_mfb,
-                src: BltRegion::Full,
-                dest: (phys_x as usize, phys_y as usize),
-                dims: (POINTER_WIDTH, POINTER_HEIGHT),
-            });
         });
 
         let duration = if window.has_active_animations() {
