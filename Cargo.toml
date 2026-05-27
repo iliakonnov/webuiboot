@@ -8,6 +8,7 @@ uefi = { version = "0.37.0", default-features = false, features = ["alloc", "glo
 smoltcp = { version = "0.13.1", default-features = false, features = ["alloc", "async", "socket-dhcpv4", "socket-tcp"] }
 log = "0.4.30"
 uefi-raw = "0.14.0"
+httparse = { version = "1.9.0", default-features = false }
 slint = { version = "1.7.2", default-features = false, features = ["compat-1-2", "renderer-software", "libm", "log", "unsafe-single-threaded"] }
 
 [build-dependencies]

@@ -124,22 +124,28 @@ pub enum BootSelection {
 }
 
 pub fn handle_http_request(request: &[u8]) -> Option<(String, Option<BootSelection>)> {
-    let req_str = match core::str::from_utf8(request) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
+    let mut headers = [httparse::EMPTY_HEADER; 16];
+    let mut req = httparse::Request::new(&mut headers);
 
-    if req_str.starts_with("GET / ") || req_str.starts_with("GET /HTTP") {
+    match req.parse(request) {
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+
+    let path = req.path?;
+    let method = req.method?;
+
+    if method == "GET" && (path == "/" || path == "/index.html") {
         let response = alloc::format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             HTML_UI.len(),
             HTML_UI
         );
         Some((response, None))
-    } else if req_str.starts_with("POST /boot/windows ") {
+    } else if method == "POST" && path == "/boot/windows" {
         let response = alloc::format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK");
         Some((response, Some(BootSelection::Windows)))
-    } else if req_str.starts_with("POST /boot/linux ") {
+    } else if method == "POST" && path == "/boot/linux" {
         let response = alloc::format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK");
         Some((response, Some(BootSelection::Linux)))
     } else {
