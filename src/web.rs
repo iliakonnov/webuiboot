@@ -10,7 +10,7 @@ pub enum BootSelection {
 pub struct Response<'a> {
     status_code: u16,
     status_text: &'a str,
-    headers: alloc::vec::Vec<(&'a str, &'a str)>,
+    headers: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
     body: &'a [u8],
 }
 
@@ -24,13 +24,15 @@ impl<'a> Response<'a> {
         }
     }
 
-    pub fn header(mut self, name: &'a str, value: &'a str) -> Self {
-        self.headers.push((name, value));
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((alloc::string::String::from(name), alloc::string::String::from(value)));
         self
     }
 
-    pub fn body(mut self, body: &'a [u8]) -> Self {
+    pub fn body(mut self, body: &'a [u8], content_type: &str) -> Self {
         self.body = body;
+        self = self.header("Content-Type", content_type);
+        self = self.header("Content-Length", &alloc::format!("{}", body.len()));
         self
     }
 
@@ -69,22 +71,20 @@ pub fn handle_http_request(request: &[u8]) -> Option<(String, Option<BootSelecti
 
     if method == "GET" && (path == "/" || path == "/index.html") {
         let response = Response::new(200, "OK")
-            .header("Content-Type", "text/html")
-            .header("Content-Length", &alloc::format!("{}", HTML_UI.len()))
             .header("Connection", "close")
-            .body(HTML_UI.as_bytes())
+            .body(HTML_UI.as_bytes(), "text/html")
             .serialize();
         Some((response, None))
     } else if method == "POST" && path == "/boot/windows" {
         let response = Response::new(200, "OK")
             .header("Connection", "close")
-            .body(b"OK")
+            .body(b"OK", "text/plain")
             .serialize();
         Some((response, Some(BootSelection::Windows)))
     } else if method == "POST" && path == "/boot/linux" {
         let response = Response::new(200, "OK")
             .header("Connection", "close")
-            .body(b"OK")
+            .body(b"OK", "text/plain")
             .serialize();
         Some((response, Some(BootSelection::Linux)))
     } else {
