@@ -120,6 +120,9 @@ pub fn update_slint_ip(ip: &str) {
 }
 
 pub(crate) async fn run_network() {
+    let mut pending_boot = None;
+    let mut pending_boot_time = None;
+
     loop {
         let net_ptr = core::ptr::addr_of_mut!(GLOBAL_NET);
         let mut got_ip = None;
@@ -159,9 +162,25 @@ pub(crate) async fn run_network() {
                         if let Some((response, selection)) = web::handle_http_request(&request_buffer[..size_read]) {
                             let _ = tcp_socket.send_slice(response.as_bytes());
                             tcp_socket.close();
-                            boot_sel = selection;
+                            if selection.is_some() {
+                                pending_boot = selection;
+                                pending_boot_time = Some(ms);
+                            }
                         }
                     }
+                }
+            }
+
+            if pending_boot.is_some() {
+                let state = tcp_socket.state();
+                let elapsed = pending_boot_time.map(|start| ms.saturating_sub(start)).unwrap_or(0);
+                if state == smoltcp::socket::tcp::State::Closed
+                    || state == smoltcp::socket::tcp::State::TimeWait
+                    || (tcp_socket.send_queue() == 0 && elapsed >= 100)
+                    || elapsed >= 500
+                {
+                    boot_sel = pending_boot.take();
+                    pending_boot_time = None;
                 }
             }
         }
