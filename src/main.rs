@@ -7,6 +7,8 @@ mod boot;
 mod net;
 mod web;
 mod slint_plat;
+mod executor;
+mod futures;
 
 use log::{info, warn};
 use uefi::prelude::*;
@@ -117,50 +119,73 @@ pub fn update_slint_ip(ip: &str) {
     }
 }
 
-pub fn poll_network_from_slint(ip_out: &mut Option<alloc::string::String>) -> Option<crate::web::BootSelection> {
-    let net_ptr = core::ptr::addr_of_mut!(GLOBAL_NET);
-    let net = unsafe { (*net_ptr).as_mut()? };
-    
-    net.ms_elapsed += 5; // wait_for_input waits roughly 5ms
-    let timestamp = Instant::from_millis(net.ms_elapsed as i64);
-    
-    net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
+pub(crate) async fn run_network() {
+    loop {
+        let net_ptr = core::ptr::addr_of_mut!(GLOBAL_NET);
+        let mut got_ip = None;
+        let mut boot_sel = None;
 
-    // Process DHCP
-    let dhcp_event = net.sockets.get_mut::<Dhcpv4Socket>(net.dhcp_handle).poll();
-    if let Some(Dhcpv4Event::Configured(config)) = dhcp_event {
-        info!("DHCP configured!");
-        info!("IP: {}", config.address);
-        net.iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs.clear();
-            ip_addrs.push(IpCidr::Ipv4(config.address)).unwrap();
-        });
-        if let Some(router) = config.router {
-            let _ = net.iface.routes_mut().add_default_ipv4_route(router);
-        }
-        *ip_out = Some(alloc::format!("{}", config.address));
-    }
+        if let Some(net) = unsafe { (*net_ptr).as_mut() } {
+            let ms = crate::slint_plat::get_ms_since_start();
+            let timestamp = Instant::from_millis(net.ms_elapsed as i64 + ms as i64);
+            
+            net.iface.poll(timestamp, &mut net.device, &mut net.sockets);
 
-    // Process TCP
-    let tcp_socket = net.sockets.get_mut::<TcpSocket>(net.tcp_handle);
-    if !tcp_socket.is_open() {
-        let _ = tcp_socket.listen(80);
-    }
+            // Process DHCP
+            let dhcp_event = net.sockets.get_mut::<Dhcpv4Socket>(net.dhcp_handle).poll();
+            if let Some(Dhcpv4Event::Configured(config)) = dhcp_event {
+                info!("DHCP configured!");
+                info!("IP: {}", config.address);
+                net.iface.update_ip_addrs(|ip_addrs| {
+                    ip_addrs.clear();
+                    ip_addrs.push(IpCidr::Ipv4(config.address)).unwrap();
+                });
+                if let Some(router) = config.router {
+                    let _ = net.iface.routes_mut().add_default_ipv4_route(router);
+                }
+                got_ip = Some(alloc::format!("{}", config.address));
+            }
 
-    if tcp_socket.can_recv() {
-        let mut request_buffer = [0u8; 1024];
-        if let Ok(size_read) = tcp_socket.recv_slice(&mut request_buffer) {
-            if size_read > 0 {
-                if let Some((response, boot_sel)) = web::handle_http_request(&request_buffer[..size_read]) {
-                    let _ = tcp_socket.send_slice(response.as_bytes());
-                    tcp_socket.close();
-                    return boot_sel; // Return remote boot request!
+            // Process TCP
+            let tcp_socket = net.sockets.get_mut::<TcpSocket>(net.tcp_handle);
+            if !tcp_socket.is_open() {
+                let _ = tcp_socket.listen(80);
+            }
+
+            if tcp_socket.can_recv() {
+                let mut request_buffer = [0u8; 1024];
+                if let Ok(size_read) = tcp_socket.recv_slice(&mut request_buffer) {
+                    if size_read > 0 {
+                        if let Some((response, selection)) = web::handle_http_request(&request_buffer[..size_read]) {
+                            let _ = tcp_socket.send_slice(response.as_bytes());
+                            tcp_socket.close();
+                            boot_sel = selection;
+                        }
+                    }
                 }
             }
         }
+
+        if let Some(ip) = got_ip {
+            update_slint_ip(&ip);
+        }
+
+        if let Some(sel) = boot_sel {
+            match sel {
+                crate::web::BootSelection::Windows => {
+                    info!("Remote boot: Windows");
+                    crate::boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
+                }
+                crate::web::BootSelection::Linux => {
+                    info!("Remote boot: Linux");
+                    crate::boot::boot_linux_direct();
+                }
+            }
+        }
+
+        // Wait for next packet or timer tick
+        crate::futures::NetworkSleepFuture::new().await;
     }
-    
-    None
 }
 
 fn wait_for_gdb() {
@@ -188,6 +213,7 @@ fn wait_for_gdb() {
 #[entry]
 fn efi_main() -> Status {
     uefi::helpers::init().expect("Failed to initialize UEFI runtime");
+    crate::slint_plat::init_global_timer();
 
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);

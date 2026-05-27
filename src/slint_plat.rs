@@ -8,11 +8,31 @@ use uefi::Char16;
 use uefi::boot::ScopedProtocol;
 use uefi::proto::console::{gop::{BltPixel, GraphicsOutput, BltOp, BltRegion}, pointer::Pointer};
 
-static mut MOUSE_POINTERS: alloc::vec::Vec<ScopedProtocol<Pointer>> = alloc::vec::Vec::new();
+pub(crate) static mut MOUSE_POINTERS: alloc::vec::Vec<ScopedProtocol<Pointer>> = alloc::vec::Vec::new();
 static mut GLOBAL_GOP: Option<*mut GraphicsOutput> = None;
 static mut GLOBAL_FB: Option<*mut [SlintBltPixel]> = None;
 static mut GLOBAL_WINDOW: Option<alloc::rc::Weak<software_renderer::MinimalSoftwareWindow>> = None;
 static mut IN_FLUSH: bool = false;
+
+static mut GLOBAL_TIMER_START: u64 = 0;
+static mut GLOBAL_TIMER_FREQ: u64 = 0;
+
+pub fn init_global_timer() {
+    unsafe {
+        GLOBAL_TIMER_START = timer_tick();
+        GLOBAL_TIMER_FREQ = timer_freq();
+    }
+}
+
+pub fn get_ms_since_start() -> u64 {
+    unsafe {
+        if GLOBAL_TIMER_FREQ == 0 {
+            return 0;
+        }
+        let elapsed = timer_tick() - GLOBAL_TIMER_START;
+        (elapsed * 1000) / GLOBAL_TIMER_FREQ
+    }
+}
 
 const POINTER_WIDTH: usize = 12;
 const POINTER_HEIGHT: usize = 19;
@@ -126,10 +146,6 @@ fn get_key_press() -> Option<char> {
     }
 }
 
-fn wait_for_input(max_timeout: Option<Duration>) {
-    let timeout = Duration::from_millis(5).min(max_timeout.unwrap_or(Duration::from_millis(5)));
-    uefi::boot::stall(timeout);
-}
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -192,8 +208,6 @@ impl slint::platform::Platform for Platform {
             let info = mode.info();
             let (w, h) = info.resolution();
             info!("  - Mode: {}x{}", w, h);
-            // Cap at 1920x1080 to prevent UEFI heap memory exhaustion (33MB for 4K is too large for UEFI allocator)
-            // 1080p scales with a perfect 2:1 integer ratio on 4K displays, keeping text perfectly crisp
             if w <= 1920 && h <= 1080 {
                 if w > best_width || (w == best_width && h > best_height) {
                     best_width = w;
@@ -215,8 +229,8 @@ impl slint::platform::Platform for Platform {
         let screen_width = resolution.0;
         let screen_height = resolution.1;
 
-        let mut fb = alloc::vec![SlintBltPixel(BltPixel::new(0, 0, 0)); screen_width * screen_height];
-        let mut mfb = alloc::vec![BltPixel::new(0, 0, 0); POINTER_WIDTH * POINTER_HEIGHT];
+        let fb = alloc::vec![SlintBltPixel(BltPixel::new(0, 0, 0)); screen_width * screen_height];
+        let mfb = alloc::vec![BltPixel::new(0, 0, 0); POINTER_WIDTH * POINTER_HEIGHT];
 
         self.window.set_size(slint::PhysicalSize::new(
             screen_width.try_into().unwrap(),
@@ -232,159 +246,177 @@ impl slint::platform::Platform for Platform {
         };
         let _ = self.window.try_dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor });
 
-        let mut phys_x = (screen_width / 2) as f32;
-        let mut phys_y = (screen_height / 2) as f32;
-        let mut is_mouse_move = false;
+        // Leak heap allocations to ensure they acquire 'static lifetime for the async task
+        let gop_static = alloc::boxed::Box::leak(alloc::boxed::Box::new(gop));
+        let fb_static = alloc::boxed::Box::leak(fb.into_boxed_slice());
+        let mfb_static = alloc::boxed::Box::leak(mfb.into_boxed_slice());
 
         unsafe {
-            GLOBAL_GOP = Some(&mut *gop as *mut GraphicsOutput);
-            GLOBAL_FB = Some(fb.as_mut_slice() as *mut [SlintBltPixel]);
+            GLOBAL_GOP = Some(&mut **gop_static as *mut GraphicsOutput);
+            GLOBAL_FB = Some(fb_static as *mut [SlintBltPixel]);
             GLOBAL_WINDOW = Some(Rc::downgrade(&self.window));
         }
 
-        loop {
-            let mut ip_str = None;
-            let boot_selection = crate::poll_network_from_slint(&mut ip_str);
-            
-            if let Some(selection) = boot_selection {
-                match selection {
-                    crate::web::BootSelection::Windows => crate::boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"),
-                    crate::web::BootSelection::Linux => crate::boot::boot_linux_direct(),
+        // Initialize executor and spawn tasks
+        let mut executor = crate::executor::Executor::new();
+        executor.spawn(crate::run_network());
+        executor.spawn(run_slint_ui(
+            self.window.clone(),
+            gop_static,
+            fb_static,
+            mfb_static,
+            screen_width as usize,
+            screen_height as usize,
+            scale_factor,
+        ));
+
+        executor.run();
+
+        Ok(())
+    }
+}
+
+async fn run_slint_ui(
+    window: Rc<software_renderer::MinimalSoftwareWindow>,
+    gop: &'static mut GraphicsOutput,
+    fb: &'static mut [SlintBltPixel],
+    mfb: &'static mut [BltPixel],
+    screen_width: usize,
+    screen_height: usize,
+    scale_factor: f32,
+) {
+    let mut phys_x = (screen_width / 2) as f32;
+    let mut phys_y = (screen_height / 2) as f32;
+    let mut is_mouse_move = false;
+
+    loop {
+        slint::platform::update_timers_and_animations();
+
+        // Keyboard input
+        let mut direct_boot = None;
+        while let Some(key) = get_key_press() {
+            if key == '1' || key == 'w' || key == 'W' {
+                direct_boot = Some(crate::web::BootSelection::Windows);
+            } else if key == '2' || key == 'l' || key == 'L' {
+                direct_boot = Some(crate::web::BootSelection::Linux);
+            }
+
+            let text = slint::SharedString::from(key);
+            let _ = window.try_dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+            let _ = window.try_dispatch_event(WindowEvent::KeyReleased { text });
+        }
+
+        if let Some(selection) = direct_boot {
+            match selection {
+                crate::web::BootSelection::Windows => {
+                    info!("Direct keyboard boot: Windows");
+                    crate::boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
                 }
-            }
-
-            if let Some(ip) = ip_str {
-                crate::update_slint_ip(&ip);
-            }
-
-            slint::platform::update_timers_and_animations();
-
-            // Keyboard input
-            let mut direct_boot = None;
-            while let Some(key) = get_key_press() {
-                if key == '1' || key == 'w' || key == 'W' {
-                    direct_boot = Some(crate::web::BootSelection::Windows);
-                } else if key == '2' || key == 'l' || key == 'L' {
-                    direct_boot = Some(crate::web::BootSelection::Linux);
+                crate::web::BootSelection::Linux => {
+                    info!("Direct keyboard boot: Linux");
+                    crate::boot::boot_linux_direct();
                 }
-
-                let text = slint::SharedString::from(key);
-                let _ = self.window.try_dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
-                let _ = self.window.try_dispatch_event(WindowEvent::KeyReleased { text });
-            }
-
-            if let Some(selection) = direct_boot {
-                match selection {
-                    crate::web::BootSelection::Windows => {
-                        info!("Direct keyboard boot: Windows");
-                        crate::boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
-                    }
-                    crate::web::BootSelection::Linux => {
-                        info!("Direct keyboard boot: Linux");
-                        crate::boot::boot_linux_direct();
-                    }
-                }
-            }
-
-            // Mouse input
-            let pointers = unsafe { &mut *core::ptr::addr_of_mut!(MOUSE_POINTERS) };
-            for mpointer in pointers.iter_mut() {
-                loop {
-                    match mpointer.read_state() {
-                        Ok(Some(mouse)) => {
-                            // Raw movement counts are typically small integers. 
-                            // Add them directly with a sensitivity factor.
-                            // We scale sensitivity by scale_factor so physical mouse movement translates naturally on high-DPI screens.
-                            let sensitivity = 2.0 * scale_factor;
-                            phys_x += (mouse.relative_movement[0] as f32) * sensitivity;
-                            phys_y += (mouse.relative_movement[1] as f32) * sensitivity;
-
-                            // Clamp physical position to physical screen bounds
-                            phys_x = phys_x.clamp(0.0, (screen_width - POINTER_WIDTH) as f32);
-                            phys_y = phys_y.clamp(0.0, (screen_height - POINTER_HEIGHT) as f32);
-
-                            let button = match mouse.button {
-                                [true, _] => PointerEventButton::Left,
-                                [_, true] => PointerEventButton::Right,
-                                _ => PointerEventButton::Other,
-                            };
-
-                            let logical_pos = slint::LogicalPosition::new(phys_x / scale_factor, phys_y / scale_factor);
-
-                            let _ = self.window.try_dispatch_event(WindowEvent::PointerMoved { position: logical_pos });
-                            let _ = self.window.try_dispatch_event(WindowEvent::PointerExited {});
-                            if mouse.button[0] || mouse.button[1] {
-                                let _ = self.window.try_dispatch_event(WindowEvent::PointerPressed { position: logical_pos, button });
-                                  let _ = self.window.try_dispatch_event(WindowEvent::PointerReleased { position: logical_pos, button });
-                            }
-                            if mouse.relative_movement[2] != 0 {
-                                let delta_y = -(mouse.relative_movement[2] as f32) * 30.0;
-                                let _ = self.window.try_dispatch_event(WindowEvent::PointerScrolled {
-                                    position: logical_pos,
-                                    delta_x: 0.0,
-                                    delta_y,
-                                });
-                            }
-                            is_mouse_move = true;
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            log::warn!("Raw UEFI mouse error: {:?}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if is_mouse_move {
-                self.window.request_redraw();
-                is_mouse_move = false;
-            }
-
-            self.window.draw_if_needed(|renderer| {
-                renderer.render(&mut fb, screen_width);
-
-                let blt_fb = unsafe { slice::from_raw_parts(fb.as_ptr() as *const BltPixel, fb.len()) };
-                let blt_mfb = unsafe { slice::from_raw_parts_mut(mfb.as_mut_ptr() as *mut BltPixel, mfb.len()) };
-
-                let _ = gop.blt(BltOp::BufferToVideo {
-                    buffer: blt_fb,
-                    src: BltRegion::Full,
-                    dest: (0, 0),
-                    dims: (screen_width, screen_height),
-                });
-
-                let _ = gop.blt(BltOp::VideoToBltBuffer {
-                    buffer: blt_mfb,
-                    src: (phys_x as usize, phys_y as usize),
-                    dest: BltRegion::Full,
-                    dims: (POINTER_WIDTH, POINTER_HEIGHT),
-                });
-
-                for y in 0..POINTER_HEIGHT {
-                    for x in 0..POINTER_WIDTH {
-                        let idx = x + y * POINTER_WIDTH;
-                        let pixel_type = POINTER_PIXELS[idx];
-                        if pixel_type == 1 {
-                            blt_mfb[idx] = BltPixel::new(255, 255, 255);
-                        } else if pixel_type == 2 {
-                            blt_mfb[idx] = BltPixel::new(0, 0, 0);
-                        }
-                    }
-                }
-
-                let _ = gop.blt(BltOp::BufferToVideo {
-                    buffer: blt_mfb,
-                    src: BltRegion::Full,
-                    dest: (phys_x as usize, phys_y as usize),
-                    dims: (POINTER_WIDTH, POINTER_HEIGHT),
-                });
-            });
-
-            if !self.window.has_active_animations() {
-                wait_for_input(slint::platform::duration_until_next_timer_update());
             }
         }
+
+        // Mouse input
+        let pointers = unsafe { &mut *core::ptr::addr_of_mut!(MOUSE_POINTERS) };
+        for mpointer in pointers.iter_mut() {
+            loop {
+                match mpointer.read_state() {
+                    Ok(Some(mouse)) => {
+                        let sensitivity = 2.0 * scale_factor;
+                        phys_x += (mouse.relative_movement[0] as f32) * sensitivity;
+                        phys_y += (mouse.relative_movement[1] as f32) * sensitivity;
+
+                        phys_x = phys_x.clamp(0.0, (screen_width - POINTER_WIDTH) as f32);
+                        phys_y = phys_y.clamp(0.0, (screen_height - POINTER_HEIGHT) as f32);
+
+                        let button = match mouse.button {
+                            [true, _] => PointerEventButton::Left,
+                            [_, true] => PointerEventButton::Right,
+                            _ => PointerEventButton::Other,
+                        };
+
+                        let logical_pos = slint::LogicalPosition::new(phys_x / scale_factor, phys_y / scale_factor);
+
+                        let _ = window.try_dispatch_event(WindowEvent::PointerMoved { position: logical_pos });
+                        let _ = window.try_dispatch_event(WindowEvent::PointerExited {});
+                        if mouse.button[0] || mouse.button[1] {
+                            let _ = window.try_dispatch_event(WindowEvent::PointerPressed { position: logical_pos, button });
+                            let _ = window.try_dispatch_event(WindowEvent::PointerReleased { position: logical_pos, button });
+                        }
+                        if mouse.relative_movement[2] != 0 {
+                            let delta_y = -(mouse.relative_movement[2] as f32) * 30.0;
+                            let _ = window.try_dispatch_event(WindowEvent::PointerScrolled {
+                                position: logical_pos,
+                                delta_x: 0.0,
+                                delta_y,
+                            });
+                        }
+                        is_mouse_move = true;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        log::warn!("Raw UEFI mouse error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if is_mouse_move {
+            window.request_redraw();
+            is_mouse_move = false;
+        }
+
+        window.draw_if_needed(|renderer| {
+            renderer.render(fb, screen_width);
+
+            let blt_fb = unsafe { slice::from_raw_parts(fb.as_ptr() as *const BltPixel, fb.len()) };
+            let blt_mfb = unsafe { slice::from_raw_parts_mut(mfb.as_mut_ptr() as *mut BltPixel, mfb.len()) };
+
+            let _ = gop.blt(BltOp::BufferToVideo {
+                buffer: blt_fb,
+                src: BltRegion::Full,
+                dest: (0, 0),
+                dims: (screen_width, screen_height),
+            });
+
+            let _ = gop.blt(BltOp::VideoToBltBuffer {
+                buffer: blt_mfb,
+                src: (phys_x as usize, phys_y as usize),
+                dest: BltRegion::Full,
+                dims: (POINTER_WIDTH, POINTER_HEIGHT),
+            });
+
+            for y in 0..POINTER_HEIGHT {
+                for x in 0..POINTER_WIDTH {
+                    let idx = x + y * POINTER_WIDTH;
+                    let pixel_type = POINTER_PIXELS[idx];
+                    if pixel_type == 1 {
+                        blt_mfb[idx] = BltPixel::new(255, 255, 255);
+                    } else if pixel_type == 2 {
+                        blt_mfb[idx] = BltPixel::new(0, 0, 0);
+                    }
+                }
+            }
+
+            let _ = gop.blt(BltOp::BufferToVideo {
+                buffer: blt_mfb,
+                src: BltRegion::Full,
+                dest: (phys_x as usize, phys_y as usize),
+                dims: (POINTER_WIDTH, POINTER_HEIGHT),
+            });
+        });
+
+        let duration = if window.has_active_animations() {
+            Duration::from_millis(16)
+        } else {
+            slint::platform::duration_until_next_timer_update()
+                .unwrap_or(Duration::from_millis(50))
+        };
+        crate::futures::SlintSleepFuture::new(duration).await;
     }
 }
 
