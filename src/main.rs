@@ -211,7 +211,7 @@ pub(crate) async fn run_network() {
 
 pub(crate) async fn run() {
     // 1. Wait for GUI to initialize and draw (100ms)
-    crate::futures::SlintSleepFuture::new(core::time::Duration::from_millis(100)).await;
+    crate::futures::TimerSleepFuture::new(core::time::Duration::from_millis(100)).await;
 
     // 2. Check and process bootnext
     crate::boot::check_and_process_bootnext();
@@ -232,10 +232,16 @@ fn wait_for_gdb() {
     }
 
     #[unsafe(no_mangle)]
+    #[used]
     static mut GDB_ATTACHED: usize = 0;
 
     unsafe {
+        let start_time = crate::slint_plat::get_ms_since_start();
         while core::ptr::read_volatile(&raw mut GDB_ATTACHED) == 0 {
+            let elapsed = crate::slint_plat::get_ms_since_start().saturating_sub(start_time);
+            if elapsed >= 3000 {
+                break;
+            }
             core::hint::spin_loop();
         }
     }
@@ -251,7 +257,7 @@ fn efi_main() -> Status {
     log::set_max_level(log::LevelFilter::Info);
 
     #[cfg(debug_assertions)]
-    wait_for_gdb(); // Uncomment to debug
+    wait_for_gdb();
 
     info!("Starting Web & Slint UI Bootloader...");
 

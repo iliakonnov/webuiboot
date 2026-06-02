@@ -178,7 +178,9 @@ impl Executor {
 
         let mut events = Vec::new();
         for (event, _) in &self.event_registry {
-            events.push(unsafe { event.unsafe_clone() });
+            if !events.iter().any(|e| e == event) {
+                events.push(unsafe { event.unsafe_clone() });
+            }
         }
 
         if events.is_empty() {
@@ -186,15 +188,20 @@ impl Executor {
             return;
         }
 
-        if let Ok(index) = uefi::boot::wait_for_event(events.as_mut_slice()) {
-            if index < events.len() {
-                let signaled_event = &events[index];
-                if let Some((_, task_id)) = self.event_registry.iter().find(|(e, _)| e == signaled_event) {
-                    if !self.run_queue.contains(task_id) {
-                        self.run_queue.push(*task_id);
+        match uefi::boot::wait_for_event(events.as_mut_slice()) {
+            Ok(index) => {
+                if index < events.len() {
+                    let signaled_event = &events[index];
+                    for (e, task_id) in &self.event_registry {
+                        if e == signaled_event {
+                            if !self.run_queue.contains(task_id) {
+                                self.run_queue.push(*task_id);
+                            }
+                        }
                     }
                 }
             }
+            Err(_) => {}
         }
     }
 

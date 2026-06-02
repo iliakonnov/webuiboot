@@ -3,6 +3,22 @@ use uefi::boot::LoadImageSource;
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode, Directory};
 use uefi::proto::media::fs::SimpleFileSystem;
 
+fn open_protocol_shared<P: uefi::proto::ProtocolPointer + ?Sized>(
+    handle: uefi::Handle,
+) -> Result<uefi::boot::ScopedProtocol<P>, uefi::Status> {
+    unsafe {
+        uefi::boot::open_protocol::<P>(
+            uefi::boot::OpenProtocolParams {
+                handle,
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            uefi::boot::OpenProtocolAttributes::GetProtocol,
+        )
+        .map_err(|e| e.status())
+    }
+}
+
 fn find_all_entries(root: &mut Directory) -> Option<alloc::vec::Vec<alloc::string::String>> {
     let entries_path = uefi::CString16::try_from("\\loader\\entries").ok()?;
     let mut entries_dir = match root.open(&entries_path, FileMode::Read, FileAttribute::DIRECTORY) {
@@ -41,7 +57,7 @@ pub fn boot_linux_direct() {
     };
 
     for handle in fs_handles {
-        let mut fs = match uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle) {
+        let mut fs = match open_protocol_shared::<SimpleFileSystem>(handle) {
             Ok(fs) => fs,
             Err(_) => continue,
         };
@@ -176,7 +192,7 @@ pub fn boot_linux_direct() {
                 continue;
             }
 
-            let device_path = match uefi::boot::open_protocol_exclusive::<uefi::proto::device_path::DevicePath>(handle) {
+            let device_path = match open_protocol_shared::<uefi::proto::device_path::DevicePath>(handle) {
                 Ok(dp) => dp,
                 Err(_) => continue,
             };
@@ -243,7 +259,7 @@ pub fn boot_os(path: &str) -> Result<(), uefi::Status> {
     };
 
     for handle in fs_handles {
-        let mut fs = match uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle) {
+        let mut fs = match open_protocol_shared::<SimpleFileSystem>(handle) {
             Ok(fs) => fs,
             Err(_) => continue,
         };
@@ -289,7 +305,7 @@ pub fn boot_os(path: &str) -> Result<(), uefi::Status> {
             }
         }
 
-        let device_path = match uefi::boot::open_protocol_exclusive::<uefi::proto::device_path::DevicePath>(handle) {
+        let device_path = match open_protocol_shared::<uefi::proto::device_path::DevicePath>(handle) {
             Ok(dp) => dp,
             Err(_) => continue,
         };
@@ -335,21 +351,14 @@ pub fn check_and_process_bootnext() {
 
     let fs_handles = match uefi::boot::find_handles::<SimpleFileSystem>() {
         Ok(h) => h,
-        Err(_) => {
-            info!("No SimpleFileSystem handles found.");
+        Err(e) => {
+            info!("Failed to find SimpleFileSystem handles: {:?}", e);
             return;
         }
     };
 
-    let flag_filenames = &["\\bootnext.txt", "\\EFI\\bootnext.txt"];
-    let mut processed = false;
-
     for handle in fs_handles {
-        if processed {
-            break;
-        }
-
-        let mut fs = match uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle) {
+        let mut fs = match open_protocol_shared::<SimpleFileSystem>(handle) {
             Ok(fs) => fs,
             Err(_) => continue,
         };
@@ -358,6 +367,9 @@ pub fn check_and_process_bootnext() {
             Ok(root) => root,
             Err(_) => continue,
         };
+
+        let flag_filenames = &["\\bootnext.txt", "\\EFI\\bootnext.txt"];
+        let mut processed = false;
 
         for flag_filename in flag_filenames {
             let flag_cstr16 = match uefi::CString16::try_from(*flag_filename) {
@@ -368,9 +380,7 @@ pub fn check_and_process_bootnext() {
             // Try to open flag file for Read/Write to be able to modify or delete it
             let file_handle = match root.open(&flag_cstr16, FileMode::ReadWrite, FileAttribute::empty()) {
                 Ok(f) => f,
-                Err(_) => {
-                    continue;
-                }
+                Err(_) => continue,
             };
 
             let mut regular_file = match file_handle.into_regular_file() {
@@ -481,6 +491,10 @@ pub fn check_and_process_bootnext() {
                 }
             }
 
+            break;
+        }
+
+        if processed {
             break;
         }
     }

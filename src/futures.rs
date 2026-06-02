@@ -20,9 +20,16 @@ impl NetworkSleepFuture {
 
 impl Drop for NetworkSleepFuture {
     fn drop(&mut self) {
-        if let Some(timer) = self.timer_event.take() {
-            let _ = uefi::boot::close_event(timer);
-        }
+        let _ = self.timer_event.take();
+    }
+}
+
+#[cfg(not(feature = "wait-packet-workaround"))]
+fn get_packet_wait_event() -> Option<uefi::Event> {
+    unsafe {
+        let net_ptr = core::ptr::addr_of_mut!(crate::GLOBAL_NET);
+        let net = (*net_ptr).as_ref()?;
+        net.device.snp.wait_for_packet_event().ok()
     }
 }
 
@@ -35,32 +42,28 @@ impl Future for NetworkSleepFuture {
         }
         self.is_started = true;
 
+        #[cfg(not(feature = "wait-packet-workaround"))]
         if let Some(packet_event) = get_packet_wait_event() {
             register_event_for_current_task(&packet_event);
         }
 
         unsafe {
-            if let Ok(timer) = uefi::boot::create_event(
+            match uefi::boot::create_event(
                 uefi::boot::EventType::TIMER,
-                uefi::boot::Tpl::CALLBACK,
+                uefi::boot::Tpl::APPLICATION,
                 None,
                 None,
             ) {
-                let _ = uefi::boot::set_timer(&timer, uefi::boot::TimerTrigger::Relative(100_000)); // 10ms
-                register_event_for_current_task(&timer);
-                self.timer_event = Some(timer);
+                Ok(timer) => {
+                    let _ = uefi::boot::set_timer(&timer, uefi::boot::TimerTrigger::Relative(100_000));
+                    register_event_for_current_task(&timer);
+                    self.timer_event = Some(timer);
+                }
+                Err(_) => {}
             }
         }
 
         Poll::Pending
-    }
-}
-
-fn get_packet_wait_event() -> Option<uefi::Event> {
-    unsafe {
-        let net_ptr = core::ptr::addr_of_mut!(crate::GLOBAL_NET);
-        let net = (*net_ptr).as_ref()?;
-        net.device.snp.wait_for_packet_event().ok()
     }
 }
 
@@ -82,9 +85,7 @@ impl SlintSleepFuture {
 
 impl Drop for SlintSleepFuture {
     fn drop(&mut self) {
-        if let Some(timer) = self.timer_event.take() {
-            let _ = uefi::boot::close_event(timer);
-        }
+        let _ = self.timer_event.take();
     }
 }
 
@@ -113,15 +114,18 @@ impl Future for SlintSleepFuture {
         let ticks = (self.duration.as_nanos() / 100) as u64;
         if ticks > 0 {
             unsafe {
-                if let Ok(timer) = uefi::boot::create_event(
+                match uefi::boot::create_event(
                     uefi::boot::EventType::TIMER,
-                    uefi::boot::Tpl::CALLBACK,
+                    uefi::boot::Tpl::APPLICATION,
                     None,
                     None,
                 ) {
-                    let _ = uefi::boot::set_timer(&timer, uefi::boot::TimerTrigger::Relative(ticks));
-                    register_event_for_current_task(&timer);
-                    self.timer_event = Some(timer);
+                    Ok(timer) => {
+                        let _ = uefi::boot::set_timer(&timer, uefi::boot::TimerTrigger::Relative(ticks));
+                        register_event_for_current_task(&timer);
+                        self.timer_event = Some(timer);
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -129,3 +133,58 @@ impl Future for SlintSleepFuture {
         Poll::Pending
     }
 }
+
+pub struct TimerSleepFuture {
+    timer_event: Option<uefi::Event>,
+    is_started: bool,
+    duration: Duration,
+}
+
+impl TimerSleepFuture {
+    pub fn new(duration: Duration) -> Self {
+        Self {
+            timer_event: None,
+            is_started: false,
+            duration,
+        }
+    }
+}
+
+impl Drop for TimerSleepFuture {
+    fn drop(&mut self) {
+        let _ = self.timer_event.take();
+    }
+}
+
+impl Future for TimerSleepFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.is_started {
+            return Poll::Ready(());
+        }
+        self.is_started = true;
+
+        let ticks = (self.duration.as_nanos() / 100) as u64;
+        if ticks > 0 {
+            unsafe {
+                match uefi::boot::create_event(
+                    uefi::boot::EventType::TIMER,
+                    uefi::boot::Tpl::APPLICATION,
+                    None,
+                    None,
+                ) {
+                    Ok(timer) => {
+                        let _ = uefi::boot::set_timer(&timer, uefi::boot::TimerTrigger::Relative(ticks));
+                        register_event_for_current_task(&timer);
+                        self.timer_event = Some(timer);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        Poll::Pending
+    }
+}
+

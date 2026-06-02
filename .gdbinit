@@ -13,14 +13,18 @@ print(f"Found PE Base Address: {hex(base_address)}")
 
 image_base = 0x140000000
 offset = base_address - image_base
-filepath = gdb.current_progspace().filename
+filepath = gdb.current_progspace().filename.replace('\\', '/')
 print(f"Relocating IDE-loaded file: {filepath}")
 gdb.execute("set confirm off")
 gdb.execute(f"symbol-file {filepath} -o {offset}")
 gdb.execute("set confirm on")
-end
 
-    set language c
-    set *(unsigned long long*)&GDB_ATTACHED = 1
-    set language rust
+try:
+    gdb.execute("set language c")
+    gdb.execute("set *(unsigned long long*)&GDB_ATTACHED = 1")
+except gdb.error as e:
+    print(f"[WARNING] Could not set GDB_ATTACHED: {e}")
+finally:
+    gdb.execute("set language rust")
+end
 end
