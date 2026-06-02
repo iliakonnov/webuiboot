@@ -259,7 +259,7 @@ impl slint::platform::Platform for Platform {
 
         // Initialize executor and spawn tasks
         let mut executor = crate::executor::Executor::new();
-        executor.spawn(crate::run_network());
+        executor.spawn(crate::run());
         executor.spawn(run_slint_ui(
             self.window.clone(),
             gop_static,
@@ -310,7 +310,9 @@ async fn run_slint_ui(
             match selection {
                 crate::web::BootSelection::Windows => {
                     info!("Direct keyboard boot: Windows");
-                    crate::boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
+                    if let Err(e) = crate::boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi") {
+                        log::error!("Direct keyboard boot Windows failed: {:?}", e);
+                    }
                 }
                 crate::web::BootSelection::Linux => {
                     info!("Direct keyboard boot: Linux");

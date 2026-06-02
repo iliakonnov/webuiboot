@@ -10,7 +10,7 @@ mod slint_plat;
 mod executor;
 mod futures;
 
-use log::{info, warn};
+use log::{info, warn, error};
 use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::network::snp::SimpleNetwork;
@@ -193,7 +193,9 @@ pub(crate) async fn run_network() {
             match sel {
                 crate::web::BootSelection::Windows => {
                     info!("Remote boot: Windows");
-                    crate::boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
+                    if let Err(e) = crate::boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi") {
+                        error!("Remote boot Windows failed: {:?}", e);
+                    }
                 }
                 crate::web::BootSelection::Linux => {
                     info!("Remote boot: Linux");
@@ -205,6 +207,17 @@ pub(crate) async fn run_network() {
         // Wait for next packet or timer tick
         crate::futures::NetworkSleepFuture::new().await;
     }
+}
+
+pub(crate) async fn run() {
+    // 1. Wait for GUI to initialize and draw (100ms)
+    crate::futures::SlintSleepFuture::new(core::time::Duration::from_millis(100)).await;
+
+    // 2. Check and process bootnext
+    crate::boot::check_and_process_bootnext();
+
+    // 3. Otherwise, run network routine
+    run_network().await;
 }
 
 fn wait_for_gdb() {
@@ -317,7 +330,9 @@ fn efi_main() -> Status {
 
     // Setup Callbacks
     ui.on_boot_windows(|| {
-        boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
+        if let Err(e) = boot::boot_os("\\EFI\\Microsoft\\Boot\\bootmgfw.efi") {
+            error!("Failed to boot Windows: {:?}", e);
+        }
     });
 
     ui.on_boot_linux(|| {
