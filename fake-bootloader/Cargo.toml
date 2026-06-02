@@ -1,0 +1,15 @@
+[package]
+name = "fake-bootloader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+uefi = { version = "0.37.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
+
+[[bin]]
+name = "fake_windows"
+path = "src/windows.rs"
+
+[[bin]]
+name = "fake_linux"
+path = "src/linux.rs"

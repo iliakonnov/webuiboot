@@ -1,0 +1,12 @@
+[package]
+name = "webuiboot-e2e"
+version = "0.1.0"
+edition = "2024"
+
+[[test]]
+name = "e2e"
+path = "src/e2e.rs"
+harness = true
+
+[dependencies]
+tempfile = "3.27.0"

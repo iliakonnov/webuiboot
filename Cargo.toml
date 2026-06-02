@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "fake-bootloader", "tests"]
+resolver = "2"
+
 [package]
 name = "webuiboot"
 version = "0.1.0"

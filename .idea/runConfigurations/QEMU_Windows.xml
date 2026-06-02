@@ -1,0 +1,10 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="QEMU-Windows" type="com.jetbrains.cidr.embedded.customgdbserver.type" factoryName="com.jetbrains.cidr.embedded.customgdbserver.factory" PROGRAM_PARAMS="--accel whpx -machine q35 -gdb tcp::19641 -drive if=pflash,format=raw,readonly=on,file=&quot;C:\Program Files\qemu\share\edk2-x86_64-code.fd&quot; -drive format=raw,file=fat:rw:esp -nic user,model=e1000,net=10.0.2.0/24,dhcpstart=10.0.2.15,hostfwd=tcp:127.0.0.1:8080-:80 -serial stdio -device qemu-xhci -device usb-mouse" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="webuiboot" TARGET_NAME="all" CONFIG_NAME="all" version="1" RUN_PATH="$PROJECT_DIR$/target/x86_64-unknown-uefi-debug/debug/webuiboot.efi">
+    <custom-gdb-server version="1" gdb-connect="tcp::19641" executable="C:\Program Files\qemu\qemu-system-x86_64.exe" warmup-ms="3000" download-type="NONE" reset-cmd="monitor system_reset" reset-type="AFTER_DOWNLOAD">
+      <debugger kind="GDB" isBundled="true" />
+    </custom-gdb-server>
+    <method v="2">
+      <option name="CLION.COMPOUND.BUILD" enabled="true" />
+    </method>
+  </configuration>
+</component>

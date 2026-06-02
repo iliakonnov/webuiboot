@@ -3,20 +3,10 @@ use uefi::boot::LoadImageSource;
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode, Directory};
 use uefi::proto::media::fs::SimpleFileSystem;
 
-fn open_protocol_shared<P: uefi::proto::ProtocolPointer + ?Sized>(
+fn open_protocol_exclusive<P: uefi::proto::ProtocolPointer + ?Sized>(
     handle: uefi::Handle,
 ) -> Result<uefi::boot::ScopedProtocol<P>, uefi::Status> {
-    unsafe {
-        uefi::boot::open_protocol::<P>(
-            uefi::boot::OpenProtocolParams {
-                handle,
-                agent: uefi::boot::image_handle(),
-                controller: None,
-            },
-            uefi::boot::OpenProtocolAttributes::GetProtocol,
-        )
-        .map_err(|e| e.status())
-    }
+    uefi::boot::open_protocol_exclusive::<P>(handle).map_err(|e| e.status())
 }
 
 fn find_all_entries(root: &mut Directory) -> Option<alloc::vec::Vec<alloc::string::String>> {
@@ -57,7 +47,7 @@ pub fn boot_linux_direct() {
     };
 
     for handle in fs_handles {
-        let mut fs = match open_protocol_shared::<SimpleFileSystem>(handle) {
+        let mut fs = match open_protocol_exclusive::<SimpleFileSystem>(handle) {
             Ok(fs) => fs,
             Err(_) => continue,
         };
@@ -192,7 +182,7 @@ pub fn boot_linux_direct() {
                 continue;
             }
 
-            let device_path = match open_protocol_shared::<uefi::proto::device_path::DevicePath>(handle) {
+            let device_path = match open_protocol_exclusive::<uefi::proto::device_path::DevicePath>(handle) {
                 Ok(dp) => dp,
                 Err(_) => continue,
             };
@@ -259,7 +249,7 @@ pub fn boot_os(path: &str) -> Result<(), uefi::Status> {
     };
 
     for handle in fs_handles {
-        let mut fs = match open_protocol_shared::<SimpleFileSystem>(handle) {
+        let mut fs = match open_protocol_exclusive::<SimpleFileSystem>(handle) {
             Ok(fs) => fs,
             Err(_) => continue,
         };
@@ -305,7 +295,7 @@ pub fn boot_os(path: &str) -> Result<(), uefi::Status> {
             }
         }
 
-        let device_path = match open_protocol_shared::<uefi::proto::device_path::DevicePath>(handle) {
+        let device_path = match open_protocol_exclusive::<uefi::proto::device_path::DevicePath>(handle) {
             Ok(dp) => dp,
             Err(_) => continue,
         };
@@ -358,119 +348,140 @@ pub fn check_and_process_bootnext() {
     };
 
     for handle in fs_handles {
-        let mut fs = match open_protocol_shared::<SimpleFileSystem>(handle) {
-            Ok(fs) => fs,
-            Err(_) => continue,
-        };
-
-        let mut root = match fs.open_volume() {
-            Ok(root) => root,
-            Err(_) => continue,
-        };
-
-        let flag_filenames = &["\\bootnext.txt", "\\EFI\\bootnext.txt"];
+        let mut target_path_str = None;
         let mut processed = false;
 
-        for flag_filename in flag_filenames {
-            let flag_cstr16 = match uefi::CString16::try_from(*flag_filename) {
-                Ok(c) => c,
+        {
+            let mut fs = match open_protocol_exclusive::<SimpleFileSystem>(handle) {
+                Ok(fs) => fs,
                 Err(_) => continue,
             };
 
-            // Try to open flag file for Read/Write to be able to modify or delete it
-            let file_handle = match root.open(&flag_cstr16, FileMode::ReadWrite, FileAttribute::empty()) {
-                Ok(f) => f,
+            let mut root = match fs.open_volume() {
+                Ok(root) => root,
                 Err(_) => continue,
             };
 
-            let mut regular_file = match file_handle.into_regular_file() {
-                Some(f) => f,
-                None => continue,
-            };
+            let flag_filenames = &["\\bootnext.txt", "\\EFI\\bootnext.txt"];
 
-            info!("Found bootnext flag file: {}", flag_filename);
-            processed = true;
+            for flag_filename in flag_filenames {
+                let flag_cstr16 = match uefi::CString16::try_from(*flag_filename) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
 
-            let info = match regular_file.get_boxed_info::<FileInfo>() {
-                Ok(info) => info,
-                Err(_) => {
-                    error!("Failed to get bootnext file info");
+                // Try to open flag file for Read/Write to be able to modify or delete it
+                let file_handle = match root.open(&flag_cstr16, FileMode::ReadWrite, FileAttribute::empty()) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+
+                let mut regular_file = match file_handle.into_regular_file() {
+                    Some(f) => f,
+                    None => continue,
+                };
+
+                info!("Found bootnext flag file: {}", flag_filename);
+                processed = true;
+
+                let info = match regular_file.get_boxed_info::<FileInfo>() {
+                    Ok(info) => info,
+                    Err(_) => {
+                        error!("Failed to get bootnext file info");
+                        break;
+                    }
+                };
+
+                let size = info.file_size() as usize;
+                let mut buffer = alloc::vec![0u8; size];
+
+                if let Err(e) = regular_file.read(&mut buffer) {
+                    error!("Failed to read bootnext flag file: {:?}", e);
                     break;
                 }
-            };
 
-            let size = info.file_size() as usize;
-            let mut buffer = alloc::vec![0u8; size];
+                let content_str = match core::str::from_utf8(&buffer) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("bootnext file content is not valid UTF-8: {:?}", e);
+                        break;
+                    }
+                };
 
-            if let Err(e) = regular_file.read(&mut buffer) {
-                error!("Failed to read bootnext flag file: {:?}", e);
+                // Handle BOM (byte order mark) if present
+                let trimmed_content = content_str.strip_prefix("\u{feff}").unwrap_or(content_str);
+
+                // Parse lines, skip empty lines
+                let mut lines = trimmed_content.lines().map(|line| line.trim()).filter(|line| !line.is_empty());
+                let first_line = lines.next();
+
+                if let Some(target_path) = first_line {
+                    target_path_str = Some(alloc::string::String::from(target_path));
+                    let remaining_lines: alloc::vec::Vec<&str> = lines.collect();
+
+                    info!("Popped boot loader path: {}", target_path_str.as_ref().unwrap());
+
+                    // Delete the old file
+                    match regular_file.delete() {
+                        Ok(_) => {
+                            info!("Deleted old bootnext file.");
+                        }
+                        Err(_) => {
+                            error!("Failed to delete old bootnext file.");
+                        }
+                    }
+
+                    // Write remaining lines back if not empty
+                    if !remaining_lines.is_empty() {
+                        // Recreate the file empty
+                        let new_handle = match root.open(&flag_cstr16, FileMode::CreateReadWrite, FileAttribute::empty()) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                error!("Failed to recreate bootnext file: {:?}", e);
+                                break;
+                            }
+                        };
+
+                        let mut new_file = match new_handle.into_regular_file() {
+                            Some(f) => f,
+                            None => break,
+                        };
+
+                        let mut new_content = alloc::string::String::new();
+                        for (i, line) in remaining_lines.iter().enumerate() {
+                            if i > 0 {
+                                new_content.push_str("\r\n");
+                            }
+                            new_content.push_str(line);
+                        }
+                        new_content.push_str("\r\n");
+
+                        if let Err(e) = new_file.write(new_content.as_bytes()) {
+                            error!("Failed to write updated bootnext file: {:?}", e);
+                        }
+                        let _ = new_file.flush();
+                    } else {
+                        info!("No remaining bootloader paths. bootnext file removed.");
+                    }
+                } else {
+                    // File is empty, just remove it from disk
+                    info!("bootnext file is empty. Removing it from disk.");
+                    match regular_file.delete() {
+                        Ok(_) => {
+                            info!("Removed empty bootnext file.");
+                        }
+                        Err(_) => {
+                            error!("Failed to remove empty bootnext file.");
+                        }
+                    }
+                }
+
                 break;
             }
+        } // `fs` and `root` are dropped/closed here!
 
-            let content_str = match core::str::from_utf8(&buffer) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("bootnext file content is not valid UTF-8: {:?}", e);
-                    break;
-                }
-            };
-
-            // Handle BOM (byte order mark) if present
-            let trimmed_content = content_str.strip_prefix("\u{feff}").unwrap_or(content_str);
-
-            // Parse lines, skip empty lines
-            let mut lines = trimmed_content.lines().map(|line| line.trim()).filter(|line| !line.is_empty());
-            let first_line = lines.next();
-
-            if let Some(target_path) = first_line {
-                let target_path_str = alloc::string::String::from(target_path);
-                let remaining_lines: alloc::vec::Vec<&str> = lines.collect();
-
-                info!("Popped boot loader path: {}", target_path_str);
-
-                // Delete the old file
-                match regular_file.delete() {
-                    Ok(_) => {
-                        info!("Deleted old bootnext file.");
-                    }
-                    Err(_) => {
-                        error!("Failed to delete old bootnext file.");
-                    }
-                }
-
-                // Write remaining lines back if not empty
-                if !remaining_lines.is_empty() {
-                    // Recreate the file empty
-                    let new_handle = match root.open(&flag_cstr16, FileMode::CreateReadWrite, FileAttribute::empty()) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            error!("Failed to recreate bootnext file: {:?}", e);
-                            break;
-                        }
-                    };
-
-                    let mut new_file = match new_handle.into_regular_file() {
-                        Some(f) => f,
-                        None => break,
-                    };
-
-                    let mut new_content = alloc::string::String::new();
-                    for (i, line) in remaining_lines.iter().enumerate() {
-                        if i > 0 {
-                            new_content.push_str("\r\n");
-                        }
-                        new_content.push_str(line);
-                    }
-                    new_content.push_str("\r\n");
-
-                    if let Err(e) = new_file.write(new_content.as_bytes()) {
-                        error!("Failed to write updated bootnext file: {:?}", e);
-                    }
-                    let _ = new_file.flush();
-                } else {
-                    info!("No remaining bootloader paths. bootnext file removed.");
-                }
-
+        if processed {
+            if let Some(target_path_str) = target_path_str {
                 // Try to boot the popped path
                 info!("Attempting immediate boot of: {}", target_path_str);
                 let boot_path = target_path_str.replace('/', "\\");
@@ -478,23 +489,7 @@ pub fn check_and_process_bootnext() {
                     error!("Immediate boot failed: {:?}", e);
                     info!("Resuming normal bootloader operations.");
                 }
-            } else {
-                // File is empty, just remove it from disk
-                info!("bootnext file is empty. Removing it from disk.");
-                match regular_file.delete() {
-                    Ok(_) => {
-                        info!("Removed empty bootnext file.");
-                    }
-                    Err(_) => {
-                        error!("Failed to remove empty bootnext file.");
-                    }
-                }
             }
-
-            break;
-        }
-
-        if processed {
             break;
         }
     }
