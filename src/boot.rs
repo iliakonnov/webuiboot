@@ -38,6 +38,168 @@ fn find_all_entries(root: &mut Directory) -> Option<alloc::vec::Vec<alloc::strin
     Some(entries)
 }
 
+fn boot_linux_from_entry_file(
+    root: &mut Directory,
+    fs_handle: uefi::Handle,
+    entry_path_str: &str,
+) -> Result<(), uefi::Status> {
+    let entry_path = uefi::CString16::try_from(entry_path_str)
+        .map_err(|_| uefi::Status::INVALID_PARAMETER)?;
+
+    let file_handle = root
+        .open(&entry_path, FileMode::Read, FileAttribute::empty())
+        .map_err(|e| e.status())?;
+
+    let mut regular_file = file_handle
+        .into_regular_file()
+        .ok_or(uefi::Status::LOAD_ERROR)?;
+
+    let info = regular_file
+        .get_boxed_info::<FileInfo>()
+        .map_err(|e| e.status())?;
+
+    let size = info.file_size() as usize;
+    let mut buffer = alloc::vec![0u8; size];
+    regular_file
+        .read(&mut buffer)
+        .map_err(|e| e.status())?;
+
+    let content_str = core::str::from_utf8(&buffer)
+        .map_err(|_| uefi::Status::LOAD_ERROR)?;
+
+    let mut linux_path = None;
+    let mut initrd_paths = alloc::vec::Vec::new();
+    let mut options_str = None;
+
+    for line in content_str.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let key = match parts.next() {
+            Some(k) => k,
+            None => continue,
+        };
+
+        let value = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+        if value.is_empty() {
+            continue;
+        }
+
+        match key {
+            "linux" => linux_path = Some(alloc::string::String::from(value)),
+            "initrd" => initrd_paths.push(alloc::string::String::from(value)),
+            "options" => options_str = Some(alloc::string::String::from(value)),
+            _ => {}
+        }
+    }
+
+    let linux_val = match linux_path {
+        Some(p) => p,
+        None => {
+            info!("Entry {} is not a Linux entry (no 'linux' key). Skipping.", entry_path_str);
+            return Err(uefi::Status::NOT_FOUND);
+        }
+    };
+
+    info!("Found Linux boot entry: {}", entry_path_str);
+
+    let linux_path = linux_val.replace('/', "\\");
+
+    let mut final_options = options_str.unwrap_or_else(|| alloc::string::String::new());
+    for initrd in initrd_paths {
+        let win_initrd = initrd.replace('/', "\\");
+        if !final_options.is_empty() {
+            final_options.push(' ');
+        }
+        final_options.push_str("initrd=");
+        final_options.push_str(&win_initrd);
+    }
+
+    info!("Linux path: {}", linux_path);
+    info!("Kernel options: {}", final_options);
+
+    let linux_cstr = uefi::CString16::try_from(linux_path.as_str())
+        .map_err(|_| uefi::Status::INVALID_PARAMETER)?;
+
+    let kernel_handle = root
+        .open(&linux_cstr, FileMode::Read, FileAttribute::empty())
+        .map_err(|e| e.status())?;
+
+    let mut kernel_file = kernel_handle
+        .into_regular_file()
+        .ok_or(uefi::Status::LOAD_ERROR)?;
+
+    let k_info = kernel_file
+        .get_boxed_info::<FileInfo>()
+        .map_err(|e| e.status())?;
+
+    let k_size = k_info.file_size() as usize;
+    let mut k_buffer = alloc::vec![0u8; k_size];
+    kernel_file
+        .read(&mut k_buffer)
+        .map_err(|e| e.status())?;
+
+    let device_path = open_protocol_exclusive::<uefi::proto::device_path::DevicePath>(fs_handle)?;
+
+    info!("Loading Linux kernel EFI Stub into memory...");
+    let loaded_os = match uefi::boot::load_image(
+        uefi::boot::image_handle(),
+        LoadImageSource::FromBuffer {
+            buffer: &k_buffer,
+            file_path: Some(&device_path),
+        },
+    ) {
+        Ok(img) => img,
+        Err(e) => {
+            error!("Failed to load Linux kernel image: {:?}", e);
+            return Err(e.status());
+        }
+    };
+
+    let mut loaded_image = match uefi::boot::open_protocol_exclusive::<uefi::proto::loaded_image::LoadedImage>(loaded_os) {
+        Ok(li) => li,
+        Err(e) => {
+            error!("Failed to open LoadedImage protocol: {:?}", e);
+            let _ = uefi::boot::unload_image(loaded_os);
+            return Err(e.status());
+        }
+    };
+
+    let options_cstr16 = match uefi::CString16::try_from(final_options.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = uefi::boot::unload_image(loaded_os);
+            return Err(uefi::Status::INVALID_PARAMETER);
+        }
+    };
+
+    unsafe {
+        let slice = options_cstr16.as_slice_with_nul();
+        loaded_image.set_load_options(
+            slice.as_ptr() as *const u8,
+            (slice.len() * 2) as u32,
+        );
+    }
+
+    info!("Starting Linux kernel directly. Exiting bootloader control...");
+    crate::slint_plat::force_flush_logs();
+    uefi::boot::stall(core::time::Duration::from_millis(1500));
+    let _ = uefi::system::with_stdout(|stdout| {
+        let _ = stdout.reset(false);
+    });
+    
+    if let Err(e) = uefi::boot::start_image(loaded_os) {
+        error!("Failed to start Linux kernel image: {:?}", e);
+        let _ = uefi::boot::unload_image(loaded_os);
+        return Err(e.status());
+    }
+
+    Ok(())
+}
+
 pub fn boot_linux_direct() {
     info!("Attempting to boot Linux directly...");
 
@@ -71,167 +233,8 @@ pub fn boot_linux_direct() {
 
         for entry_filename in sorted_entries {
             let entry_path_str = alloc::format!("\\loader\\entries\\{}", entry_filename);
-            let entry_path = match uefi::CString16::try_from(entry_path_str.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let file_handle = match root.open(&entry_path, FileMode::Read, FileAttribute::empty()) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-
-            let mut regular_file = match file_handle.into_regular_file() {
-                Some(f) => f,
-                None => continue,
-            };
-
-            let info = match regular_file.get_boxed_info::<FileInfo>() {
-                Ok(info) => info,
-                Err(_) => continue,
-            };
-
-            let size = info.file_size() as usize;
-            let mut buffer = alloc::vec![0u8; size];
-            if regular_file.read(&mut buffer).is_err() {
-                continue;
-            }
-
-            let content_str = match core::str::from_utf8(&buffer) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            let mut linux_path = None;
-            let mut initrd_paths = alloc::vec::Vec::new();
-            let mut options_str = None;
-
-            for line in content_str.lines() {
-                let line = line.trim();
-                if line.starts_with('#') || line.is_empty() {
-                    continue;
-                }
-
-                let mut parts = line.split_whitespace();
-                let key = match parts.next() {
-                    Some(k) => k,
-                    None => continue,
-                };
-
-                let value = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
-                if value.is_empty() {
-                    continue;
-                }
-
-                match key {
-                    "linux" => linux_path = Some(alloc::string::String::from(value)),
-                    "initrd" => initrd_paths.push(alloc::string::String::from(value)),
-                    "options" => options_str = Some(alloc::string::String::from(value)),
-                    _ => {}
-                }
-            }
-
-            let linux_val = match linux_path {
-                Some(p) => p,
-                None => {
-                    info!("Entry {} is not a Linux entry (no 'linux' key). Skipping.", entry_filename);
-                    continue;
-                }
-            };
-
-            info!("Found Linux boot entry: {}", entry_filename);
-
-            let linux_path = linux_val.replace('/', "\\");
-
-            let mut final_options = options_str.unwrap_or_else(|| alloc::string::String::new());
-            for initrd in initrd_paths {
-                let win_initrd = initrd.replace('/', "\\");
-                if !final_options.is_empty() {
-                    final_options.push(' ');
-                }
-                final_options.push_str("initrd=");
-                final_options.push_str(&win_initrd);
-            }
-
-            info!("Linux path: {}", linux_path);
-            info!("Kernel options: {}", final_options);
-
-            let linux_cstr = match uefi::CString16::try_from(linux_path.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let kernel_handle = match root.open(&linux_cstr, FileMode::Read, FileAttribute::empty()) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-
-            let mut kernel_file = match kernel_handle.into_regular_file() {
-                Some(f) => f,
-                None => continue,
-            };
-
-            let k_info = match kernel_file.get_boxed_info::<FileInfo>() {
-                Ok(info) => info,
-                Err(_) => continue,
-            };
-
-            let k_size = k_info.file_size() as usize;
-            let mut k_buffer = alloc::vec![0u8; k_size];
-            if kernel_file.read(&mut k_buffer).is_err() {
-                continue;
-            }
-
-            let device_path = match open_protocol_exclusive::<uefi::proto::device_path::DevicePath>(handle) {
-                Ok(dp) => dp,
-                Err(_) => continue,
-            };
-
-            info!("Loading Linux kernel EFI Stub into memory...");
-            let loaded_os = match uefi::boot::load_image(
-                uefi::boot::image_handle(),
-                LoadImageSource::FromBuffer {
-                    buffer: &k_buffer,
-                    file_path: Some(&device_path),
-                },
-            ) {
-                Ok(img) => img,
-                Err(e) => {
-                    error!("Failed to load Linux kernel image: {:?}", e);
-                    continue;
-                }
-            };
-
-            let mut loaded_image = match uefi::boot::open_protocol_exclusive::<uefi::proto::loaded_image::LoadedImage>(loaded_os) {
-                Ok(li) => li,
-                Err(e) => {
-                    error!("Failed to open LoadedImage protocol: {:?}", e);
-                    continue;
-                }
-            };
-
-            let options_cstr16 = match uefi::CString16::try_from(final_options.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            unsafe {
-                let slice = options_cstr16.as_slice_with_nul();
-                loaded_image.set_load_options(
-                    slice.as_ptr() as *const u8,
-                    (slice.len() * 2) as u32,
-                );
-            }
-
-            info!("Starting Linux kernel directly. Exiting bootloader control...");
-            crate::slint_plat::force_flush_logs();
-            uefi::boot::stall(core::time::Duration::from_millis(1500));
-            let _ = uefi::system::with_stdout(|stdout| {
-                let _ = stdout.reset(false);
-            });
-            
-            if let Err(e) = uefi::boot::start_image(loaded_os) {
-                error!("Failed to start Linux kernel image: {:?}", e);
+            if let Err(e) = boot_linux_from_entry_file(&mut root, handle, &entry_path_str) {
+                error!("Failed to boot Linux entry {}: {:?}", entry_path_str, e);
                 continue;
             }
         }
@@ -258,6 +261,15 @@ pub fn boot_os(path: &str) -> Result<(), uefi::Status> {
             Ok(root) => root,
             Err(_) => continue,
         };
+
+        let is_systemd_entry = path.ends_with(".conf") || path.ends_with(".CONF");
+        if is_systemd_entry {
+            if let Err(e) = boot_linux_from_entry_file(&mut root, handle, path) {
+                error!("Failed to boot Linux entry {}: {:?}", path, e);
+                continue;
+            }
+            return Ok(());
+        }
 
         let cstr16 = match uefi::CString16::try_from(path) {
             Ok(c) => c,

@@ -240,3 +240,47 @@ fn test_bootnext_fallback_on_failure() {
         result.serial_output
     );
 }
+
+#[test]
+fn test_bootnext_systemd_entry() {
+    let mut runner = QemuRunner::new("bootnext_systemd");
+    // Place a systemd entry path in bootnext
+    runner.prepare_esp(Some("\\loader\\entries\\test.conf\r\n"));
+    runner.start_qemu();
+
+    // Since bootnext is processed immediately at startup, it should boot directly
+    let result = runner.wait_and_collect(Duration::from_secs(12));
+
+    assert!(!result.timed_out, "QEMU timed out waiting for shutdown");
+    assert!(
+        result.serial_output.contains("BOOTED: \\vmlinuz-test"),
+        "Expected Bootnext Linux systemd boot, got:\n{}",
+        result.serial_output
+    );
+
+    // Verify it popped the entry and deleted/updated the file
+    assert!(
+        result.serial_output.contains("No remaining bootloader paths") || 
+        result.serial_output.contains("Removed empty bootnext"),
+        "Expected bootnext file to be consumed or removed, got logs:\n{}",
+        result.serial_output
+    );
+}
+
+#[test]
+fn test_bootnext_systemd_entry_forward_slash() {
+    let mut runner = QemuRunner::new("bootnext_systemd_forward");
+    // Place a systemd entry path with forward slashes in bootnext
+    runner.prepare_esp(Some("/loader/entries/test.conf\r\n"));
+    runner.start_qemu();
+
+    // Since bootnext is processed immediately at startup, it should boot directly
+    let result = runner.wait_and_collect(Duration::from_secs(12));
+
+    assert!(!result.timed_out, "QEMU timed out waiting for shutdown");
+    assert!(
+        result.serial_output.contains("BOOTED: \\vmlinuz-test"),
+        "Expected Bootnext Linux systemd boot, got:\n{}",
+        result.serial_output
+    );
+}
