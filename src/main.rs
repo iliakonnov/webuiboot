@@ -12,6 +12,7 @@ mod futures;
 
 use log::{info, warn, error};
 use uefi::prelude::*;
+#[cfg(debug_assertions)]
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::network::snp::SimpleNetwork;
 use alloc::boxed::Box;
@@ -213,13 +214,11 @@ pub(crate) async fn run() {
     // 1. Wait for GUI to initialize and draw (100ms)
     crate::futures::TimerSleepFuture::new(core::time::Duration::from_millis(100)).await;
 
-    // 2. Check and process bootnext
-    crate::boot::check_and_process_bootnext();
-
-    // 3. Otherwise, run network routine
+    // 2. Run network routine
     run_network().await;
 }
 
+#[cfg(debug_assertions)]
 fn wait_for_gdb() {
     let loaded_image = uefi::boot::open_protocol_exclusive::<LoadedImage>(uefi::boot::image_handle()).unwrap();
 
@@ -260,6 +259,10 @@ fn efi_main() -> Status {
     wait_for_gdb();
 
     info!("Starting Web & Slint UI Bootloader...");
+
+    // Check and process bootnext before initializing GOP or UI.
+    // If a bootnext file is found and successfully booted, this will not return.
+    crate::boot::check_and_process_bootnext();
 
     // Setup network interface
     let snp_handle = match uefi::boot::find_handles::<SimpleNetwork>() {
